@@ -239,11 +239,20 @@ static const uint32_t FRAC_Q16[8] = {0, 8192, 16384, 21845, 32768, 43691, 49152,
 static const uint32_t METAL_INC[6] = {19994485u, 29645987u, 35995917u, 50906563u, 52591437u, 77913240u}; /* 808 hats */
 static int32_t ENVF[128];                                                                                /* frames */
 
-/* phase step per frame of a note in 1/256 semitones: 440 Hz x 2^32 / 44100 x 2^((n - 69) / 12) */
+/* No 64-bit maths in the sound: on the FM-1 it is done in software by an old compiler, inside the audio interrupt.
+ * x (0 .. 2^24) times c (Q28, 0 .. 1), in 32 bits */
+static int32_t mulq28(int32_t x, int32_t c) {
+  if (x <= 0) return 0;
+  uint32_t cc = (uint32_t)c >> 12, hi = (uint32_t)x >> 12, lo = (uint32_t)x & 4095u;
+  return (int32_t)(((hi * cc) >> 4) + ((lo * cc) >> 16));
+}
+/* phase step per frame of a note in 1/256 semitones, between foma's note_inc() steps */
 static uint32_t inc_of(int32_t nq8) {
-  nq8 = clampi(nq8, 0, 135 * 256);
-  int32_t l = (nq8 - 69 * 256) * 64 / 3 + (16 << 16); /* x 65536 / (12 x 256), + 16 octaves to stay positive */
-  return (uint32_t)(((uint64_t)42852282u * exp2_i(l)) >> 16);
+  nq8 = clampi(nq8, 0, 127 * 256);
+  int n = nq8 >> 8, f = nq8 & 255;
+  uint32_t a = note_inc(n);
+  if (!f || n >= 127) return a;
+  return a + ((note_inc(n + 1) - a) >> 8) * (uint32_t)f;
 }
 static int32_t coef_n(int32_t n) { /* falls to 0.001 over n steps of itself, Q28 */
   if (n < 1) n = 1;
@@ -255,7 +264,7 @@ typedef struct {
   uint32_t cph, mph, cinc, minc, ratio;
   int32_t note, target, glide, gslices; /* 1/256 semitones */
   int32_t sw, swcoef;                   /* sweep offset, 1/256 semitones (Q8 x 256), per slice coef Q28 */
-  int32_t amp, ainc, hold, rcoef;       /* Q24 */
+  int32_t amp, ainc, hold, rcoef, rdec; /* Q24; rcoef per slice, Q28 */
   int32_t menv, mainc, mend, mcoef;     /* Q24 */
   int32_t depth, fb, y1, y2;
   int32_t gl, gr; /* Q15 */
@@ -266,7 +275,7 @@ typedef struct {
   uint8_t stage, type, width;
   uint32_t lfsr, ph, inc, mph[6], minc[6];
   int32_t note, target, glide, gslices;
-  int32_t amp, ainc, hold, rcoef;
+  int32_t amp, ainc, hold, rcoef, rdec;
   int32_t hpa, hpl;                   /* one-pole highpass */
   int32_t f, q, low, band, sh;        /* RS: bandpass; sample and hold */
   int32_t lpa, lpl;                   /* GR: impulses through a lowpass */
@@ -293,7 +302,7 @@ static void amp_start(int32_t *amp, int32_t *ainc, int32_t *hold, int32_t *rcoef
   *hold = ENVF[v[S_HOLD]];
   int32_t r = ENVF[v[S_REL]];
   if (r < 64) r = 64;
-  *rcoef = coef_n(r);
+  *rcoef = coef_n(r / SUB + 1); /* per slice */
   *stage = 0;
 }
 
@@ -355,14 +364,14 @@ static void nz_pitch(nv_t *n) {
   /* GB / WH: the LFSR clock, 32x the note; RS: the bandpass at the note; ML: the 808 bank around note 84 */
   n->inc = inc << 5 < inc ? 0xFFFFFFFFu : inc << 5;
   if (n->type == 4 || n->type == 3) {
-    uint32_t fc = (uint32_t)(((uint64_t)inc * 44100u) >> 32); /* Hz */
+    uint32_t fc = ((inc >> 16) * 44100u) >> 16; /* Hz */
     if (fc > 15000) fc = 15000;
     n->f = sine(fc * 24348u); /* 2 sin(pi fc / 88200), Q14 */
     n->lpa = (int32_t)clampi((int32_t)(fc * 467u / 100u), 200, 32000);
   }
   if (n->type == 2) {
-    uint32_t k = exp2_i((n->note - 84 * 256) * 64 / 3 + (16 << 16)); /* Q16 */
-    for (int i = 0; i < 6; i++) n->minc[i] = (uint32_t)(((uint64_t)METAL_INC[i] * k) >> 16);
+    uint32_t k = (inc >> 10) * 256u / (note_inc(84) >> 10); /* the note against 84, Q8 */
+    for (int i = 0; i < 6; i++) n->minc[i] = (METAL_INC[i] >> 8) * k;
   }
 }
 
@@ -434,29 +443,33 @@ static void render_fm(int32_t *out, uint32_t n) {
       if (--f->gslices == 0) f->note = f->target;
     }
     if (f->sw) {
-      f->sw = (int32_t)(((int64_t)f->sw * f->swcoef) >> 28);
+      f->sw = mulq28(f->sw, f->swcoef);
       if (f->sw < 16) f->sw = 0;
     }
     f->cinc = inc_of(f->note + f->sw);
-    uint64_t mi = ((uint64_t)f->cinc * f->ratio) >> 16;
-    f->minc = mi > 0x7FFFFFFFu ? 0x7FFFFFFFu : (uint32_t)mi;
+    { /* cinc x ratio (whole + fraction), saturating */
+      uint32_t whole = f->ratio >> 16, frac = f->ratio & 0xFFFFu;
+      if (f->cinc >= 0x7FFFFFFFu / (whole + 1u)) f->minc = 0x7FFFFFFFu;
+      else f->minc = f->cinc * whole + (f->cinc >> 8) * (frac >> 8);
+    }
     if (f->mstage == 0) {
       f->menv += f->mainc;
       if (f->menv >= 1 << 24) f->menv = 1 << 24, f->mstage = 1;
     } else {
-      f->menv = f->mend + (int32_t)(((int64_t)(f->menv - f->mend) * f->mcoef) >> 28);
+      f->menv = f->mend + mulq28(f->menv - f->mend, f->mcoef);
     }
     int32_t eff = (f->depth * (f->menv >> 9)) >> 15; /* depth x envelope, 0..127 */
     int32_t mq15 = f->menv >> 9;
     int32_t amp = f->amp;
+    if (f->stage == 2) f->rdec = (amp - mulq28(amp, f->rcoef)) / SUB + 1; /* the release, as a line through this slice */
     for (uint32_t k = 0; k < n; k++) {
       if (f->stage == 0) {
         amp += f->ainc;
         if (amp >= 1 << 24) amp = 1 << 24, f->stage = 1;
       } else if (f->stage == 1) {
-        if (--f->hold <= 0) f->stage = 2;
+        if (--f->hold <= 0) f->stage = 2, f->rdec = (amp - mulq28(amp, f->rcoef)) / SUB + 1;
       } else {
-        amp = (int32_t)(((int64_t)amp * f->rcoef) >> 28);
+        amp -= f->rdec;
         if (amp < 2048) {
           f->stage = 3;
           break;
@@ -491,14 +504,15 @@ static void render_nz(int32_t *out, uint32_t n) {
     nz_pitch(v);
   }
   int32_t amp = v->amp;
+  if (v->stage == 2) v->rdec = (amp - mulq28(amp, v->rcoef)) / SUB + 1;
   for (uint32_t k = 0; k < n; k++) {
     if (v->stage == 0) {
       amp += v->ainc;
       if (amp >= 1 << 24) amp = 1 << 24, v->stage = 1;
     } else if (v->stage == 1) {
-      if (--v->hold <= 0) v->stage = 2;
+      if (--v->hold <= 0) v->stage = 2, v->rdec = (amp - mulq28(amp, v->rcoef)) / SUB + 1;
     } else {
-      amp = (int32_t)(((int64_t)amp * v->rcoef) >> 28);
+      amp -= v->rdec;
       if (amp < 2048) {
         v->stage = 3;
         break;
@@ -749,7 +763,8 @@ static int32_t soft(int32_t x) { /* soft clip above half scale */
   int32_t a = x < 0 ? -x : x;
   if (a > 16384) {
     int32_t e = a - 16384;
-    a = 16384 + (int32_t)(((int64_t)e * 16383) / (e + 16383));
+    if (e > 131071) e = 131071;
+    a = 16384 + (int32_t)(((uint32_t)e << 14) / (uint32_t)(e + 16383));
   }
   return x < 0 ? -a : a;
 }
