@@ -1,0 +1,10 @@
+{
+  "name": "7F",
+  "version": "0.1",
+  "identity": "FM-1_65",
+  "options": {
+    "usb_audio": false,
+    "trs_midi": true,
+    "midi_clock": true
+  }
+}
