@@ -62,7 +62,7 @@ typedef struct {
   uint8_t mtrk, mdst, mspd, mwav, moff, mdep;              /* the step modulator */
 } pat_t;
 
-#define MAGIC 0x37460001u /* "7F" + layout 1 */
+#define MAGIC 0x37460002u /* "7F" + layout 1; 2: the rebalanced starter loads once */
 typedef struct {
   uint32_t magic;
   uint16_t bpm;
@@ -157,40 +157,40 @@ static void starter(void) { /* something to hear at first power-on */
   for (int s = 0; s < STEPS; s++) { /* a kick: low, swept, short */
     uint8_t *v = k->st[s].v;
     v[S_NOTE] = 36, v[S_MULT] = 1, v[S_FRAC] = 0, v[S_DEPTH] = 0x18, v[S_FDBK] = 0x10, v[S_SWD] = 0x30, v[S_SWR] = 0x44;
-    v[S_HOLD] = 0x30, v[S_REL] = 0x52, v[S_MREL] = 0x30, v[S_MEND] = 0, v[S_LEVEL] = 0x7A;
+    v[S_HOLD] = 0x30, v[S_REL] = 0x52, v[S_MREL] = 0x30, v[S_MEND] = 0, v[S_LEVEL] = 0x58;
   }
-  for (int s = 0; s < 16; s += 4) set_step(k, s, 36, 0x7A);
+  for (int s = 0; s < 16; s += 4) set_step(k, s, 36, 0x58);
   static const int8_t bass[16] = {0, -1, 12, -1, 0, -1, 3, 15, 0, -1, 12, -1, 7, -1, 10, -1};
   for (int s = 0; s < STEPS; s++) { /* a bass: ratio 1, some feedback, mod envelope closing */
     uint8_t *v = b->st[s].v;
     v[S_MULT] = 1, v[S_FRAC] = 0, v[S_DEPTH] = 0x3C, v[S_FDBK] = 0x28, v[S_MREL] = 0x58, v[S_MEND] = 0x10;
     v[S_HOLD] = 0x40, v[S_REL] = 0x54, v[S_PORT] = 0;
-    if (bass[s] >= 0) set_step(b, s, 36 + bass[s], s & 2 ? 0x50 : 0x68);
+    if (bass[s] >= 0) set_step(b, s, 36 + bass[s], s & 2 ? 0x38 : 0x48);
   }
   b->st[7].v[S_PORT] = 0x50;
   for (int s = 0; s < STEPS; s++) { /* a bell: ratio 3.5 */
     uint8_t *v = e->st[s].v;
     v[S_MULT] = 3, v[S_FRAC] = 4, v[S_DEPTH] = 0x2C, v[S_MREL] = 0x64, v[S_MEND] = 0x00, v[S_HOLD] = 0, v[S_REL] = 0x6A;
-    v[S_LEVEL] = 0x48, v[S_PAN] = 2;
+    v[S_LEVEL] = 0x78, v[S_PAN] = 2;
   }
-  set_step(e, 2, 72, 0x48), set_step(e, 11, 79, 0x40);
+  set_step(e, 2, 72, 0x78), set_step(e, 11, 79, 0x70);
   e->st[2].fl |= FL_ECHO, e->st[11].fl |= FL_ECHO;
   e->erep = 4, e->espd = 9, e->epan = 3, e->etsp = 12 + 7, e->emodu = 12;
   for (int s = 0; s < STEPS; s++) { /* a pad-ish lead in parallel mode, a chord */
     uint8_t *v = l->st[s].v;
     v[S_MULT] = 2, v[S_FRAC] = 7, v[S_DEPTH] = 0x50, v[S_FDBK] = 0x08, v[S_ATK] = 0x5A, v[S_HOLD] = 0x6C, v[S_REL] = 0x6C;
-    v[S_MATK] = 0x58, v[S_MREL] = 0x68, v[S_MEND] = 0x40, v[S_LEVEL] = 0x40, v[S_PAN] = 1;
+    v[S_MATK] = 0x58, v[S_MREL] = 0x68, v[S_MEND] = 0x40, v[S_LEVEL] = 0x70, v[S_PAN] = 1;
     l->st[s].fl |= FL_PARA;
   }
-  set_step(l, 0, 60, 0x40);
+  set_step(l, 0, 60, 0x70);
   l->st[0].v[S_CH1] = 3, l->st[0].v[S_CH2] = 7;
   l->len = 16, l->rate = 6; /* half speed: once every two bars */
   for (int s = 0; s < STEPS; s++) { /* hats from the metallic noise */
     uint8_t *v = n->st[s].v;
-    v[S_MULT] = 2, v[S_FRAC] = 0x10, v[S_DEPTH] = 0x60, v[S_HOLD] = 0, v[S_REL] = 0x44, v[S_NOTE] = 84, v[S_LEVEL] = 0x50;
+    v[S_MULT] = 2, v[S_FRAC] = 0x10, v[S_DEPTH] = 0x60, v[S_HOLD] = 0x08, v[S_REL] = 0x50, v[S_NOTE] = 84, v[S_LEVEL] = 0x7F;
   }
-  for (int s = 2; s < 16; s += 4) set_step(n, s, 84, 0x48);
-  set_step(n, 15, 84, 0x38);
+  for (int s = 2; s < 16; s += 4) set_step(n, s, 84, 0x7F);
+  set_step(n, 15, 84, 0x60);
   n->st[14].v[S_REL] = 0x5C;
   n->shuf = 0x30;
   /* a modulator on track 2: its level follows a triangle over 8 steps */
@@ -279,9 +279,10 @@ static nv_t NV;
 static int32_t last_note[TRK]; /* for portamento, 1/256 semitones */
 
 static void gains(int32_t *gl, int32_t *gr, int lvl, int pan) {
-  int32_t g = lvl * lvl * 2; /* Q15, a squared curve */
-  *gl = pan == 2 ? 0 : g;
-  *gr = pan == 0 ? 0 : g;
+  int32_t g = lvl * 258; /* Q15, linear like FMS's hex levels: 40 is -6 dB, not -12 */
+  /* L / R lean hard but keep a quarter in the other side, so a panned sound never vanishes on one speaker */
+  *gl = pan == 2 ? g >> 2 : g;
+  *gr = pan == 0 ? g >> 2 : g;
 }
 
 static void amp_start(int32_t *amp, int32_t *ainc, int32_t *hold, int32_t *rcoef, uint8_t *stage, const uint8_t *v) {
